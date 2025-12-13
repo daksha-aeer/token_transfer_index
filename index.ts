@@ -1,22 +1,52 @@
+// index.ts
 import bs58 from 'bs58';
 import { subscribe, CommitmentLevel, SubscribeRequest, ChannelOptions, CompressionAlgorithms } from 'helius-laserstream'
 import type { LaserstreamConfig } from 'helius-laserstream'
 
-// function convertBuffers(obj: any): any {
-//   if (!obj) return obj;
-//   if (Buffer.isBuffer(obj) || obj instanceof Uint8Array) {
-//     return bs58.encode(obj);
-//   }
-//   if (Array.isArray(obj)) {
-//     return obj.map(item => convertBuffers(item));
-//   }
-//   if (typeof obj === 'object') {
-//     return Object.fromEntries(
-//       Object.entries(obj).map(([key, value]) => [key, convertBuffers(value)])
-//     );
-//   }
-//   return obj;
-// }
+import { Connection } from '@solana/web3.js';
+
+import { getMajorTokenMints } from "./fetch_tokens.js";
+
+import { 
+  insertTokenTransfer,
+  insertTokenTransfersBatch,
+  getLastProcessedSlot,
+  updateLastProcessedSlot, 
+  closeDatabase,
+  testConnection,
+  pool,
+  type TokenTransfer 
+} from "./db.js";
+
+// --- Batching buffer for live ingestion ---
+const LIVE_BATCH_SIZE = 200;       // tune as needed
+const LIVE_FLUSH_INTERVAL = 500;   // ms
+let liveBuffer: TokenTransfer[] = [];
+let flushInProgress = false;
+
+async function flushLiveBuffer() {
+  if (flushInProgress) return;
+  if (liveBuffer.length === 0) return;
+
+  flushInProgress = true;
+  const batch = liveBuffer.splice(0, liveBuffer.length); // take all items
+
+  try {
+    await insertTokenTransfersBatch(batch);
+  } catch (err) {
+    console.error("Live batch insert failed, items will be requeued:", err);
+    // Requeue into front — do NOT lose transfers
+    liveBuffer.unshift(...batch);
+  } finally {
+    flushInProgress = false;
+  }
+}
+
+// Flush on interval (in background)
+setInterval(() => {
+  flushLiveBuffer();
+}, LIVE_FLUSH_INTERVAL);
+
 
 const channelOptions: ChannelOptions = {
 
@@ -39,7 +69,41 @@ const channelOptions: ChannelOptions = {
   bufferSize: 131_072,
 };
 
+async function getCurrentSlot(): Promise<number> {
+  const connection = new Connection('https://mainnet.helius-rpc.com/?api-key=<api-key>');
+  try {
+    const slot: number = await connection.getSlot('confirmed');
+    console.log('Current slot (default commitment):', slot);
+    return slot;
+  } catch (error) {
+    console.error('Error fetching current slot:', error);
+    throw error;
+  }
+}
+
 async function main() {
+
+  const lastSlot = await getLastProcessedSlot();  
+  // console.log("Resuming from slot:", lastSlot.toString());
+
+  const dbConnected = await testConnection();
+  if (!dbConnected) {
+    console.error('Failed to connect to database. Exiting...');
+    process.exit(1);
+  }
+
+  let majorMints = new Set(await getMajorTokenMints());
+
+  setInterval(async () => {
+    try {
+      majorMints = new Set(await getMajorTokenMints());
+      console.log(`Refreshed token list: ${majorMints.size} tokens`);
+    } catch (err) {
+      console.error('Failed to refresh tokens:', err);
+      // Keep using old list
+    }
+  }, 6 * 60 * 60 * 1000);
+
   const request = {
     transactions: {
       "token-txs": {
@@ -63,91 +127,94 @@ async function main() {
   };
 
   const config: LaserstreamConfig = {
-    apiKey: 'YOUR_API_KEY',
+    apiKey: process.env.HELIUS_API_KEY!,
     endpoint: 'https://laserstream-mainnet-ewr.helius-rpc.com',
     maxReconnectAttempts: 10,
     channelOptions: channelOptions,
     replay: true,
   }
 
+  request.slots.slots = { start: Number(lastSlot) };
+  const currentSlot = await getCurrentSlot();
+
+  await pool.query(`
+    UPDATE pipeline_state 
+    SET streaming_start_slot = $1 
+    WHERE id = 1 AND streaming_start_slot IS NULL
+  `, [currentSlot.toString()]);
+  
+  let lastCheckpointSlot = 0n;
+  const CHECKPOINT_INTERVAL = 100n;
+
   try {
     const stream = await subscribe(
       config,
       request,
       async (update) => {
-        // if (update.slot) {
-        //   console.log(`Slot ${update.slot.slot}: parent=${update.slot.parent}`);
-        // }
         if (update.transaction?.tokenTransfers?.length > 0) {
-          for (const t of update.transaction.tokenTransfers) {
-            console.log("SPL Token Transfer Detected:");
-            console.log({
-              signature: bs58.encode(update.transaction.transaction.signature),
-              mint: t.mint,
-              from: t.fromUserAccount,
-              to: t.toUserAccount,
-              amount: t.tokenAmount,
-              decimals: t.tokenAmountDecimals,
-              slot: update.slot,
-            });
+          const slot = BigInt(update.slot);
+          const blockTime = new Date(update.transaction.transaction.blockTime * 1000);
+          const signature = bs58.encode(update.transaction.transaction.signature);
+          
+          update.transaction.tokenTransfers.forEach(
+            (t: any, i: number) => {
+              if (!majorMints.has(t.mint)) return;
+
+              const transfer: TokenTransfer = {
+                slot,
+                signature,
+                transfer_index: i,
+                mint: t.mint,
+                from_account: t.fromUserAccount || null,
+                to_account: t.toUserAccount || null,
+                amount: t.tokenAmount.toString(),
+                decimals: t.tokenAmountDecimals,
+                block_time: blockTime,
+              };
+
+              liveBuffer.push(transfer);
+            }
+          );
+
+          if (liveBuffer.length >= LIVE_BATCH_SIZE) {
+            flushLiveBuffer(); // fire-and-forget
           }
+
+
+          if (slot - lastCheckpointSlot >= CHECKPOINT_INTERVAL) {
+            try {
+              await updateLastProcessedSlot(slot);
+              lastCheckpointSlot = slot;
+            } catch (error) {
+              console.error('Failed to update slot checkpoint:', error);
+            }
+          }
+          
         }
 
-        // if (update.transaction) {
-        //   console.log(`Transaction: ${update.transaction.transaction?.signature}`);
-        //   const decodedTransaction = convertBuffers(update.transaction);
-        //   console.log('💸 Decoded transaction:', JSON.stringify(decodedTransaction, null, 2));
-
-        //   processTransaction(update.transaction);
-        // }
       },
       async (error) => {
-        console.error('Stream error:', error);
+        console.error('Stream error:', {
+          timestamp: new Date().toISOString(),
+          error: error.message,
+        });
       }
     );
 
     console.log(`Stream connected: ${stream.id}`);
     
-    // Handle graceful shutdown
-    process.on('SIGINT', () => {
+    process.on('SIGINT', async () => {
       console.log('Shutting down...');
       stream.cancel();
+      await closeDatabase();
       process.exit(0);
     });
     
   } catch (error) {
     console.error('Failed to start stream:', error);
+    await closeDatabase();
     process.exit(1);
   }
 }
-
-// function processTransaction(txUpdate: any) {
-//   const tx = txUpdate.transaction;
-//   const meta = tx.meta;
-  
-//   console.log('Transaction Details:');
-//   console.log('- Signature:', bs58.encode(tx.signature));
-//   console.log('- Slot:', txUpdate.slot);
-//   console.log('- Success:', meta.err === null);
-//   console.log('- Fee:', meta.fee, 'lamports');
-//   console.log('- Compute Units:', meta.computeUnitsConsumed);
-  
-//   // Account keys are already available in the message
-//   const message = tx.transaction.message;
-//   if (message.accountKeys) {
-//     console.log('- Account Keys:');
-//     message.accountKeys.forEach((key: Uint8Array, index: number) => {
-//       console.log(`  ${index}: ${bs58.encode(key)}`);
-//     });
-//   }
-  
-//   // Log messages are already UTF-8 strings
-//   if (meta.logMessages && meta.logMessages.length > 0) {
-//     console.log('- Log Messages:');
-//     meta.logMessages.forEach((log: string) => {
-//       console.log(`  ${log}`);
-//     });
-//   }
-// }
 
 main().catch(console.error);
