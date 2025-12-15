@@ -6,9 +6,9 @@ import type { LaserstreamConfig } from 'helius-laserstream'
 import { Connection } from '@solana/web3.js';
 
 import { getMajorTokenMints } from "./fetch_tokens.js";
+import { sleep } from "./backfill.js";
 
-import { 
-  insertTokenTransfer,
+import {
   insertTokenTransfersBatch,
   getLastProcessedSlot,
   updateLastProcessedSlot, 
@@ -21,7 +21,15 @@ import {
 // --- Batching buffer for live ingestion ---
 const LIVE_BATCH_SIZE = 200;       // tune as needed
 const LIVE_FLUSH_INTERVAL = 500;   // ms
+
+const MAX_LIVE_BUFFER = 10_000;
+const MAX_RETRY_BUFFER = 50_000;
+const RETRY_BASE_DELAY_MS = 500;
+
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY!;
+
 let liveBuffer: TokenTransfer[] = [];
+let retryBuffer: { transfer: TokenTransfer; attempts: number }[] = [];
 let flushInProgress = false;
 
 async function flushLiveBuffer() {
@@ -29,18 +37,53 @@ async function flushLiveBuffer() {
   if (liveBuffer.length === 0) return;
 
   flushInProgress = true;
-  const batch = liveBuffer.splice(0, liveBuffer.length); // take all items
+  const batch = liveBuffer.splice(0, LIVE_BATCH_SIZE);
 
   try {
     await insertTokenTransfersBatch(batch);
   } catch (err) {
-    console.error("Live batch insert failed, items will be requeued:", err);
-    // Requeue into front — do NOT lose transfers
-    liveBuffer.unshift(...batch);
+    console.error("Live batch insert failed:", err);
+
+    for (const transfer of batch) {
+      if (retryBuffer.length < MAX_RETRY_BUFFER) {
+        retryBuffer.push({ transfer, attempts: 1 });
+      } else {
+        console.error("Retry buffer full — dropping transfer:", transfer);
+      }
+    }
   } finally {
     flushInProgress = false;
   }
 }
+
+async function processRetryBuffer() {
+  if (retryBuffer.length === 0) return;
+
+  const item = retryBuffer.shift()!;
+  const delay = RETRY_BASE_DELAY_MS * Math.pow(2, item.attempts - 1);
+
+  await sleep(delay);
+
+  try {
+    await insertTokenTransfersBatch([item.transfer]);
+  } catch (err) {
+    item.attempts += 1;
+
+    if (item.attempts <= 5 && retryBuffer.length < MAX_RETRY_BUFFER) {
+      retryBuffer.push(item);
+    } else {
+      console.error(
+        "Dropping transfer after max retries:",
+        item.transfer
+      );
+    }
+  }
+}
+
+setInterval(() => {
+  processRetryBuffer();
+}, 1_000);
+
 
 // Flush on interval (in background)
 setInterval(() => {
@@ -70,7 +113,7 @@ const channelOptions: ChannelOptions = {
 };
 
 async function getCurrentSlot(): Promise<number> {
-  const connection = new Connection('https://mainnet.helius-rpc.com/?api-key=<api-key>');
+  const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`);
   try {
     const slot: number = await connection.getSlot('confirmed');
     console.log('Current slot (default commitment):', slot);
@@ -171,7 +214,14 @@ async function main() {
                 decimals: t.tokenAmountDecimals,
                 block_time: blockTime,
               };
-
+              
+              if (liveBuffer.length >= MAX_LIVE_BUFFER) {
+                console.error(
+                  `Live buffer overflow (${liveBuffer.length}). Pausing ingestion.`
+                );
+                return;
+              }
+              
               liveBuffer.push(transfer);
             }
           );
@@ -180,6 +230,7 @@ async function main() {
             flushLiveBuffer(); // fire-and-forget
           }
 
+          
 
           if (slot - lastCheckpointSlot >= CHECKPOINT_INTERVAL) {
             try {

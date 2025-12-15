@@ -35,34 +35,6 @@ export interface TokenTransfer {
 }
 
 
-/**
- * Insert a single token transfer into the database
- */
-export async function insertTokenTransfer(transfer: TokenTransfer): Promise<void> {
-  const query = `
-    INSERT INTO token_transfers (
-      slot, signature, mint, from_account, to_account, 
-      amount, decimals, block_time
-    )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    ON CONFLICT (signature) DO NOTHING
-  `;
-
-  const values = [
-    transfer.slot.toString(),
-    transfer.signature,
-    transfer.mint,
-    transfer.from_account,
-    transfer.to_account,
-    transfer.amount,
-    transfer.decimals,
-    transfer.block_time,
-  ];
-
-  await pool.query(query, values);
-}
-
-
 export async function insertTokenTransfersBatch(transfers: TokenTransfer[]): Promise<void> {
   if (transfers.length === 0) return;
 
